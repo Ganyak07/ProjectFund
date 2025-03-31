@@ -1,10 +1,4 @@
-
-;; title: ProFunding
-;; version: 1.0
-;; summary:
-;; description:
-
-;; Project Funding Platform Smart Contract
+;; ProFunding
 
 ;; Error Constants
 (define-constant error-access-denied (err u1))
@@ -28,8 +22,20 @@
     owner: principal
 })
 
-(define-map project-votes uint (map principal bool))
-(define-map project-contributions uint (map principal uint))
+(define-map project-votes {
+    project-id: uint,
+    voter: principal
+} {
+    vote: bool
+})
+
+(define-map project-contributions {
+    project-id: uint,
+    contributor: principal
+} {
+    amount: uint
+})
+
 (define-map member-profiles principal {
     role: (string-ascii 20),
     status: (string-ascii 20)
@@ -48,11 +54,16 @@
     )
 )
 
+(define-private (project-exists (project-id uint))
+    (is-some (map-get? project-details project-id))
+)
+
 ;; Member Management Functions
 
 (define-public (onboard-new-member (new-member principal))
     (begin
         (asserts! (is-active-member tx-sender) error-access-denied)
+        (asserts! (is-none (map-get? member-profiles new-member)) error-invalid-input)
         (ok (map-set member-profiles new-member {
             role: "contributor",
             status: "active"
@@ -63,6 +74,7 @@
 (define-public (offboard-member (member principal))
     (begin
         (asserts! (or (is-contract-admin) (is-eq tx-sender member)) error-access-denied)
+        (asserts! (is-some (map-get? member-profiles member)) error-item-not-found)
         (ok (map-delete member-profiles member))
     )
 )
@@ -103,53 +115,72 @@
 (define-public (cast-vote (project-id uint) (vote bool))
     (begin
         (asserts! (is-active-member tx-sender) error-access-denied)
-        (asserts! (map-get? project-details project-id) error-item-not-found)
-        (ok (map-set project-votes project-id 
-            (match (map-get? project-votes project-id)
-                existing-votes (merge existing-votes {tx-sender: vote})
-                (map-new {tx-sender: vote})
-            )
+        (asserts! (project-exists project-id) error-item-not-found)
+        (ok (map-set project-votes 
+            {
+                project-id: project-id,
+                voter: tx-sender
+            }
+            {
+                vote: vote
+            }
         ))
     )
 )
 
-(define-read-only (get-votes (project-id uint))
-    (ok (map-get? project-votes project-id))
+(define-read-only (get-vote (project-id uint) (voter principal))
+    (ok (map-get? project-votes {
+        project-id: project-id,
+        voter: voter
+    }))
 )
 
 ;; Fund Management
 
 (define-public (contribute-funds (project-id uint) (contribution-amount uint))
-    (let ((project (map-get? project-details project-id)))
+    (let (
+        (project (unwrap! (map-get? project-details project-id) error-item-not-found))
+        )
         (begin
             (asserts! (is-active-member tx-sender) error-access-denied)
-            (asserts! project error-item-not-found)
             (asserts! (>= (stx-get-balance tx-sender) contribution-amount) error-insufficient-funds)
             (asserts! (<= block-height (get deadline project)) error-invalid-input)
+            (asserts! (> contribution-amount u0) error-invalid-input)
             
             ;; Transfer funds
             (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
             
             ;; Record contribution
-            (ok (map-set project-contributions project-id 
-                (match (map-get? project-contributions project-id)
-                    existing-contributions (merge existing-contributions 
-                        {tx-sender: (+ (default-to u0 (get tx-sender existing-contributions)) contribution-amount)})
-                    (map-new {tx-sender: contribution-amount})
-                )
+            (ok (map-set project-contributions 
+                {
+                    project-id: project-id,
+                    contributor: tx-sender
+                }
+                {
+                    amount: (+ (default-to u0 
+                        (get amount (map-get? project-contributions 
+                            {
+                                project-id: project-id,
+                                contributor: tx-sender
+                            }
+                        ))) 
+                        contribution-amount)
+                }
             ))
         )
     )
 )
 
 (define-public (withdraw-funds (project-id uint))
-    (let ((project (map-get? project-details project-id))
-          (project-balance (get-project-balance project-id)))
+    (let (
+        (project (unwrap! (map-get? project-details project-id) error-item-not-found))
+        (project-balance (get-project-balance project-id))
+        )
         (begin
-            (asserts! project error-item-not-found)
             (asserts! (is-eq tx-sender (get owner project)) error-access-denied)
             (asserts! (>= block-height (get deadline project)) error-invalid-input)
             (asserts! (>= project-balance (get funding-goal project)) error-insufficient-funds)
+            (asserts! (> project-balance u0) error-insufficient-funds)
             
             ;; Transfer funds to project owner
             (as-contract (stx-transfer? project-balance tx-sender (get owner project)))
@@ -159,8 +190,13 @@
 
 (define-read-only (get-project-balance (project-id uint))
     (default-to u0 
-        (fold + u0 
-            (map-get? project-contributions project-id)))
+        (get amount (map-get? project-contributions 
+            {
+                project-id: project-id,
+                contributor: tx-sender
+            }
+        ))
+    )
 )
 
 ;; Read-only Functions
